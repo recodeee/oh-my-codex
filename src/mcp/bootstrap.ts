@@ -1,4 +1,6 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { resolve as resolvePath } from 'node:path';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 export type McpServerName = 'state' | 'memory' | 'code_intel' | 'trace' | 'wiki';
@@ -22,6 +24,8 @@ const DEFAULT_DUPLICATE_SIBLING_WATCHDOG_INTERVAL_MS = 5_000;
 const DEFAULT_DUPLICATE_SIBLING_PRE_TRAFFIC_GRACE_MS = 2_000;
 const DEFAULT_DUPLICATE_SIBLING_POST_TRAFFIC_IDLE_MS = 60_000;
 const MCP_ENTRYPOINT_PATTERN = /\b([a-z0-9-]+-server\.(?:[cm]?js|ts))\b/i;
+const MCP_PROCESS_TITLE_PATTERN = /\bomx-mcp:([a-z0-9-]+-server\.(?:[cm]?js|ts))#([a-f0-9]{12})\b/i;
+const MCP_WORKSPACE_HASH_LENGTH = 12;
 
 interface StdioLifecycleServer {
   connect(transport: StdioServerTransport): Promise<unknown>;
@@ -53,8 +57,45 @@ function normalizeCommand(command: string): string {
 }
 
 export function extractMcpEntrypointMarker(command: string): string | null {
-  const match = normalizeCommand(command).match(MCP_ENTRYPOINT_PATTERN);
+  const normalized = normalizeCommand(command);
+  const titledMatch = normalized.match(MCP_PROCESS_TITLE_PATTERN);
+  if (titledMatch?.[1]) {
+    return titledMatch[1].toLowerCase();
+  }
+  const match = normalized.match(MCP_ENTRYPOINT_PATTERN);
   return match?.[1]?.toLowerCase() ?? null;
+}
+
+function buildWorkspaceMarker(workspaceDir: string): string {
+  return createHash('sha1')
+    .update(normalizeCommand(resolvePath(workspaceDir)))
+    .digest('hex')
+    .slice(0, MCP_WORKSPACE_HASH_LENGTH);
+}
+
+export function extractMcpProcessIdentityMarker(command: string): string | null {
+  const normalized = normalizeCommand(command);
+  const titledMatch = normalized.match(MCP_PROCESS_TITLE_PATTERN);
+  if (titledMatch?.[1] && titledMatch?.[2]) {
+    return `${titledMatch[1].toLowerCase()}#${titledMatch[2].toLowerCase()}`;
+  }
+
+  return extractMcpEntrypointMarker(normalized);
+}
+
+export function buildMcpProcessIdentity(
+  command: string,
+  workspaceDir: string,
+): { entrypoint: string; marker: string; processTitle: string } | null {
+  const entrypoint = extractMcpEntrypointMarker(command);
+  if (!entrypoint) return null;
+
+  const marker = `${entrypoint}#${buildWorkspaceMarker(workspaceDir)}`;
+  return {
+    entrypoint,
+    marker,
+    processTitle: `omx-mcp:${marker}`,
+  };
 }
 
 export function parseProcessTable(output: string): ProcessTableEntry[] {
@@ -98,12 +139,12 @@ export function analyzeDuplicateSiblingState(
   processes: readonly ProcessTableEntry[],
   currentPid: number,
   currentParentPid: number,
-  currentEntrypoint: string | null,
+  currentMarker: string | null,
 ): DuplicateSiblingObservation {
-  if (!currentEntrypoint || !Number.isInteger(currentPid) || currentPid <= 0) {
+  if (!currentMarker || !Number.isInteger(currentPid) || currentPid <= 0) {
     return {
       status: 'ambiguous',
-      entrypoint: currentEntrypoint,
+      entrypoint: currentMarker,
       matchingPids: [],
       newerSiblingPids: [],
     };
@@ -113,17 +154,17 @@ export function analyzeDuplicateSiblingState(
   if (!self || self.ppid !== currentParentPid) {
     return {
       status: 'ambiguous',
-      entrypoint: currentEntrypoint,
+      entrypoint: currentMarker,
       matchingPids: [],
       newerSiblingPids: [],
     };
   }
 
-  const selfMarker = extractMcpEntrypointMarker(self.command);
-  if (selfMarker !== currentEntrypoint) {
+  const selfMarker = extractMcpProcessIdentityMarker(self.command);
+  if (selfMarker !== currentMarker) {
     return {
       status: 'ambiguous',
-      entrypoint: currentEntrypoint,
+      entrypoint: currentMarker,
       matchingPids: [],
       newerSiblingPids: [],
     };
@@ -131,13 +172,13 @@ export function analyzeDuplicateSiblingState(
 
   const matching = processes
     .filter((entry) => entry.ppid === currentParentPid)
-    .filter((entry) => extractMcpEntrypointMarker(entry.command) === currentEntrypoint)
+    .filter((entry) => extractMcpProcessIdentityMarker(entry.command) === currentMarker)
     .sort((left, right) => left.pid - right.pid);
 
   if (!matching.some((entry) => entry.pid === currentPid)) {
     return {
       status: 'ambiguous',
-      entrypoint: currentEntrypoint,
+      entrypoint: currentMarker,
       matchingPids: matching.map((entry) => entry.pid),
       newerSiblingPids: [],
     };
@@ -146,7 +187,7 @@ export function analyzeDuplicateSiblingState(
   if (matching.length <= 1) {
     return {
       status: 'unique',
-      entrypoint: currentEntrypoint,
+      entrypoint: currentMarker,
       matchingPids: matching.map((entry) => entry.pid),
       newerSiblingPids: [],
     };
@@ -158,7 +199,7 @@ export function analyzeDuplicateSiblingState(
 
   return {
     status: newerSiblingPids.length > 0 ? 'older_duplicate' : 'newest',
-    entrypoint: currentEntrypoint,
+    entrypoint: currentMarker,
     matchingPids: matching.map((entry) => entry.pid),
     newerSiblingPids,
   };
@@ -266,7 +307,8 @@ export function autoStartStdioMcpServer(
   const lifecycleDebugEnabled = env[LIFECYCLE_DEBUG_ENV] === '1';
   const lifecycleTiming = resolveLifecycleTimingConfig(env);
   const trackedParentPid = Number.isInteger(process.ppid) ? process.ppid : 0;
-  const trackedEntrypoint = extractMcpEntrypointMarker(process.argv[1] ?? '');
+  const processIdentity = buildMcpProcessIdentity(process.argv[1] ?? '', process.cwd());
+  const trackedEntrypoint = processIdentity?.marker ?? extractMcpEntrypointMarker(process.argv[1] ?? '');
   let lastTrafficAtMs: number | null = null;
   let duplicateObservedAtMs: number | null = null;
 
@@ -275,6 +317,11 @@ export function autoStartStdioMcpServer(
     const detail = error ? ` ${error instanceof Error ? error.message : String(error)}` : '';
     process.stderr.write(`[omx-${serverName}-server] ${message}${detail}\n`);
   };
+
+  if (processIdentity?.processTitle) {
+    process.title = processIdentity.processTitle;
+    logLifecycle(`process identity ${processIdentity.marker}`);
+  }
 
   const parentWatchdog = trackedParentPid > 1
     ? setInterval(() => {
