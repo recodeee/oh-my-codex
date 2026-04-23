@@ -2,6 +2,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const STARTUP_SETTLE_MS = 150;
@@ -103,14 +105,17 @@ async function waitForExit(
   }
 }
 
-function spawnEntrypoint(entrypoint: EntryPoint): {
+function spawnEntrypoint(
+  entrypoint: EntryPoint,
+  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): {
   child: ChildProcess;
   stdout: string[];
   stderr: string[];
 } {
   const child = spawn(process.execPath, [join(process.cwd(), 'dist', 'mcp', entrypoint.file)], {
-    cwd: process.cwd(),
-    env: { ...process.env },
+    cwd: options.cwd ?? process.cwd(),
+    env: { ...process.env, ...(options.env ?? {}) },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
@@ -270,6 +275,47 @@ describe('MCP stdio lifecycle runtime regression (built entrypoints)', () => {
       if (newer) {
         await forceCleanup(newer);
       }
+    }
+  });
+
+  it('same-entrypoint siblings in different cwd workspaces both survive the duplicate watchdog', async () => {
+    const entrypoint = IDLE_ENTRYPOINTS[0];
+    const cwdA = await mkdtemp(join(tmpdir(), 'omx-mcp-workspace-a-'));
+    const cwdB = await mkdtemp(join(tmpdir(), 'omx-mcp-workspace-b-'));
+    const sharedEnv = {
+      ...process.env,
+      OMX_MCP_PARENT_WATCHDOG_INTERVAL_MS: '250',
+      OMX_MCP_DUPLICATE_SIBLING_WATCHDOG_INTERVAL_MS: '250',
+      OMX_MCP_DUPLICATE_SIBLING_PRE_TRAFFIC_GRACE_MS: '500',
+      OMX_MCP_DUPLICATE_SIBLING_POST_TRAFFIC_IDLE_MS: '500',
+    };
+
+    const older = spawnEntrypoint(entrypoint, { cwd: cwdA, env: sharedEnv });
+    const newer = spawnEntrypoint(entrypoint, { cwd: cwdB, env: sharedEnv });
+
+    try {
+      await waitForSpawn(older.child, entrypoint, older.stderr, older.stdout);
+      await assertChildAliveBeforeTeardown(older.child, entrypoint, older.stderr, older.stdout);
+      await waitForSpawn(newer.child, entrypoint, newer.stderr, newer.stdout);
+      await assertChildAliveBeforeTeardown(newer.child, entrypoint, newer.stderr, newer.stdout);
+
+      await delay(1_300);
+
+      assert.equal(
+        isChildAlive(older.child),
+        true,
+        `different-cwd older server should stay alive: ${formatFailureContext(entrypoint, [...older.stderr, ...newer.stderr], [...older.stdout, ...newer.stdout])}`,
+      );
+      assert.equal(
+        isChildAlive(newer.child),
+        true,
+        `different-cwd newer server should stay alive: ${formatFailureContext(entrypoint, [...older.stderr, ...newer.stderr], [...older.stdout, ...newer.stdout])}`,
+      );
+    } finally {
+      await forceCleanup(older.child);
+      await forceCleanup(newer.child);
+      await rm(cwdA, { recursive: true, force: true });
+      await rm(cwdB, { recursive: true, force: true });
     }
   });
 });

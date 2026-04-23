@@ -4,7 +4,9 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   analyzeDuplicateSiblingState,
+  buildMcpProcessIdentity,
   extractMcpEntrypointMarker,
+  extractMcpProcessIdentityMarker,
   isParentProcessAlive,
   parseProcessTable,
   shouldAutoStartMcpServer,
@@ -135,7 +137,24 @@ describe('mcp duplicate sibling detection', () => {
       extractMcpEntrypointMarker('node C:\\\\tmp\\\\oh-my-codex\\\\dist\\\\mcp\\\\trace-server.ts'),
       'trace-server.ts',
     );
+    assert.equal(
+      extractMcpEntrypointMarker('omx-mcp:state-server.js#abc123def456'),
+      'state-server.js',
+    );
     assert.equal(extractMcpEntrypointMarker('node something-else.js'), null);
+  });
+
+  it('extracts workspace-scoped process identity markers from process titles', () => {
+    const identity = buildMcpProcessIdentity(
+      'node /tmp/oh-my-codex/dist/mcp/state-server.js',
+      '/tmp/work-a',
+    );
+
+    assert.ok(identity);
+    assert.equal(
+      extractMcpProcessIdentityMarker(identity.processTitle),
+      identity.marker,
+    );
   });
 
   it('parses ps output into process table entries', () => {
@@ -162,19 +181,47 @@ describe('mcp duplicate sibling detection', () => {
   });
 
   it('prefers the newest same-parent same-entrypoint process as survivor', () => {
+    const olderIdentity = buildMcpProcessIdentity('node /tmp/dist/mcp/state-server.js', '/tmp/work-a');
+    const newerIdentity = buildMcpProcessIdentity('node /tmp/dist/mcp/state-server.js', '/tmp/work-a');
+    assert.ok(olderIdentity);
+    assert.ok(newerIdentity);
+
     const processes = [
-      { pid: 101, ppid: 55, command: 'node /tmp/dist/mcp/state-server.js' },
-      { pid: 140, ppid: 55, command: 'node /tmp/dist/mcp/state-server.js' },
+      { pid: 101, ppid: 55, command: olderIdentity.processTitle },
+      { pid: 140, ppid: 55, command: newerIdentity.processTitle },
       { pid: 160, ppid: 55, command: 'node /tmp/dist/mcp/memory-server.js' },
     ];
 
-    const older = analyzeDuplicateSiblingState(processes, 101, 55, 'state-server.js');
-    const newest = analyzeDuplicateSiblingState(processes, 140, 55, 'state-server.js');
+    const older = analyzeDuplicateSiblingState(processes, 101, 55, olderIdentity.marker);
+    const newest = analyzeDuplicateSiblingState(processes, 140, 55, newerIdentity.marker);
 
     assert.equal(older.status, 'older_duplicate');
     assert.deepEqual(older.newerSiblingPids, [140]);
     assert.equal(newest.status, 'newest');
     assert.deepEqual(newest.newerSiblingPids, []);
+  });
+
+  it('does not treat different-workspace siblings as duplicates', () => {
+    const workA = buildMcpProcessIdentity('node /tmp/dist/mcp/state-server.js', '/tmp/work-a');
+    const workB = buildMcpProcessIdentity('node /tmp/dist/mcp/state-server.js', '/tmp/work-b');
+    assert.ok(workA);
+    assert.ok(workB);
+    assert.notEqual(workA.marker, workB.marker);
+
+    const processes = [
+      { pid: 101, ppid: 55, command: workA.processTitle },
+      { pid: 140, ppid: 55, command: workB.processTitle },
+    ];
+
+    const left = analyzeDuplicateSiblingState(processes, 101, 55, workA.marker);
+    const right = analyzeDuplicateSiblingState(processes, 140, 55, workB.marker);
+
+    assert.equal(left.status, 'unique');
+    assert.equal(right.status, 'unique');
+    assert.equal(
+      shouldSelfExitForDuplicateSibling(left, 25_000, 20_000, null),
+      false,
+    );
   });
 
   it('only lets older duplicates self-exit after the conservative grace window before traffic', () => {
